@@ -127,8 +127,15 @@ def fetch_music(mood: str) -> tuple[Path, str]:
         chosen = random.choice(local_tracks)
         return chosen, ""  # no attribution needed for YT Audio Library tracks
 
+    jamendo_id = os.environ.get("JAMENDO_CLIENT_ID")
+    if not jamendo_id:
+        raise RuntimeError(
+            "No local music found in assets/music/, and JAMENDO_CLIENT_ID is not set. "
+            "Add at least one mp3 to assets/music/ (e.g. from YouTube Audio Library)."
+        )
+
     params = {
-        "client_id": os.environ["JAMENDO_CLIENT_ID"],
+        "client_id": jamendo_id,
         "format": "json",
         "limit": 15,
         "tags": mood,
@@ -275,3 +282,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
