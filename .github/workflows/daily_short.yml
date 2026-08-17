@@ -2,10 +2,11 @@ name: Daily Motivational Short
 
 on:
   schedule:
-    # Runs every day at 9:00 AM UTC — adjust to your preferred time
-    - cron: "0 9 * * *"
+    # 6:30 AM IST (1:00 AM UTC) — morning prime time
+    - cron: "0 1 * * *"
+    # 9:30 PM IST (4:00 PM UTC) — night prime time
+    - cron: "0 16 * * *"
   workflow_dispatch: {}   # lets you trigger it manually from the Actions tab to test
-
 jobs:
   build-and-upload:
     runs-on: ubuntu-latest
