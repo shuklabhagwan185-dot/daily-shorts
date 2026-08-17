@@ -31,9 +31,18 @@ FONT_PATH = "assets/fonts/font.ttf"
 VIDEO_DURATION = 15  # seconds
 
 # Gemini model: configurable via secret since Google renames/retires models often.
-# Check https://ai.google.dev/gemini-api/docs/models for current names before relying
-# on the default below — it WILL go stale over time.
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL") or "gemini-2.5-flash"
+# If GEMINI_MODEL secret is set, that's tried first. Otherwise the script tries this
+# fallback list in order until one works — so a single Google rename doesn't break
+# the whole pipeline.
+GEMINI_MODEL_FALLBACKS = [
+    "gemini-3.6-flash",
+    "gemini-3.1-flash",
+    "gemini-2.5-flash",
+    "gemini-flash-latest",
+]
+_env_model = os.environ.get("GEMINI_MODEL")
+if _env_model:
+    GEMINI_MODEL_FALLBACKS = [_env_model] + GEMINI_MODEL_FALLBACKS
 
 # Allowed Jamendo mood tags (kept tight so results stay on-brand)
 MUSIC_MOODS = ["uplifting", "epic", "chill", "inspiring", "energetic", "calm", "cinematic", "ambient"]
@@ -42,7 +51,6 @@ MUSIC_MOODS = ["uplifting", "epic", "chill", "inspiring", "energetic", "calm", "
 # ---------- 1. GENERATE QUOTE + VISUAL THEME + MUSIC MOOD ----------
 def generate_quote_and_theme() -> dict:
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-    model = genai.GenerativeModel(GEMINI_MODEL)
     prompt = (
         "You are creating a YouTube Short for a channel focused on STUDENT MOTIVATION "
         "(exam stress, study discipline, competitive exams like NEET/JEE/UPSC, late-night "
@@ -59,7 +67,27 @@ def generate_quote_and_theme() -> dict:
         'Return ONLY valid JSON, nothing else, no markdown fences, in this exact shape:\n'
         '{"quote": "...", "visual_theme": "...", "music_mood": "..."}'
     )
-    resp = model.generate_content(prompt)
+
+    last_error = None
+    resp = None
+    for model_name in GEMINI_MODEL_FALLBACKS:
+        try:
+            print(f"Trying Gemini model: {model_name}")
+            model = genai.GenerativeModel(model_name)
+            resp = model.generate_content(prompt)
+            print(f"Success with model: {model_name}")
+            break
+        except Exception as e:
+            print(f"Model {model_name} failed: {e}")
+            last_error = e
+            continue
+
+    if resp is None:
+        raise RuntimeError(
+            f"All Gemini model names failed. Last error: {last_error}. "
+            "Check https://ai.google.dev/gemini-api/docs/models for current model "
+            "names and set GEMINI_MODEL secret accordingly."
+        )
     raw = resp.text.strip()
     raw = re.sub(r"^```(json)?|```$", "", raw.strip(), flags=re.MULTILINE).strip()
     data = json.loads(raw)
