@@ -33,7 +33,7 @@ VIDEO_DURATION = 15  # seconds
 # Gemini model: configurable via secret since Google renames/retires models often.
 # Check https://ai.google.dev/gemini-api/docs/models for current names before relying
 # on the default below — it WILL go stale over time.
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL") or "gemini-3.1-pro-preview"
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL") or "gemini-2.5-flash"
 
 # Allowed Jamendo mood tags (kept tight so results stay on-brand)
 MUSIC_MOODS = ["uplifting", "epic", "chill", "inspiring", "energetic", "calm", "cinematic", "ambient"]
