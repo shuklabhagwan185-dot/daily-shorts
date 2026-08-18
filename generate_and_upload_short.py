@@ -128,7 +128,6 @@ def generate_quote_and_theme() -> dict:
         )
 
     prompt += (
-    prompt += (
         "2. Suggest TWO short visual themes (3-5 words each) for stock footage — "
         "visual_theme_1 should match the FIRST half/mood of the text, visual_theme_2 "
         "should match the SECOND half/turn, so the video visually shifts partway "
@@ -430,4 +429,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
