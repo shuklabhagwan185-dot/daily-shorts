@@ -1,17 +1,22 @@
 """
 Daily Motivational Short — full pipeline
-1. Generate a fresh quote with Gemini (free tier)
-2. Download a random background video from Pexels (free)
-3. Pick a random local royalty-free music track
-4. Burn the quote onto the video with FFmpeg, add music
-5. Upload the finished short to YouTube
+1. Generate a fresh quote with Gemini (free tier) — English in the morning run,
+   Hinglish in the evening run — plus two visual themes and a music mood.
+2. Download TWO theme-matched background videos from Pexels (free) and concatenate them.
+3. Pick a music track SEQUENTIALLY from local files (no repeats until the list cycles),
+   falling back to a mood-matched Jamendo track if no local files are present.
+4. Burn the quote onto the video with FFmpeg, add music.
+5. Upload the finished short to YouTube.
 
 All credentials are read from environment variables (set as GitHub Secrets).
+TIME_OF_DAY env var ("morning" / "evening") controls language + is part of the
+deterministic music rotation seed — set by the workflow based on which cron fired.
 """
 
 import os
 import re
 import json
+import time
 import random
 import textwrap
 import subprocess
@@ -28,7 +33,25 @@ WORKDIR = Path("work")
 WORKDIR.mkdir(exist_ok=True)
 MUSIC_DIR = Path("assets/music")
 FONT_PATH = "assets/fonts/font.ttf"
-VIDEO_DURATION = 15  # seconds
+VIDEO_DURATION = 18  # seconds, split across 2 clips (~9s each)
+CLIP_DURATION = VIDEO_DURATION // 2
+
+TIME_OF_DAY = os.environ.get("TIME_OF_DAY", "evening").strip().lower()
+if TIME_OF_DAY not in ("morning", "evening"):
+    TIME_OF_DAY = "evening"
+
+# Content type rotation:
+# - Morning slot is always a QUOTE (best for an emotional start to the day)
+# - Evening slot alternates between a STUDY TIP and a TOPPER HABIT day-by-day,
+#   so the channel doesn't feel like an endless quote loop, while staying at
+#   exactly 2 uploads/day.
+import datetime
+_day_of_year = datetime.date.today().timetuple().tm_yday
+if TIME_OF_DAY == "morning":
+    CONTENT_TYPE = "quote"
+else:
+    CONTENT_TYPE = "tip" if _day_of_year % 2 == 0 else "habit"
+CONTENT_TYPE = os.environ.get("CONTENT_TYPE_OVERRIDE", CONTENT_TYPE)
 
 # Gemini model: configurable via secret since Google renames/retires models often.
 # If GEMINI_MODEL secret is set, that's tried first. Otherwise the script tries this
@@ -48,24 +71,79 @@ if _env_model:
 MUSIC_MOODS = ["uplifting", "epic", "chill", "inspiring", "energetic", "calm", "cinematic", "ambient"]
 
 
-# ---------- 1. GENERATE QUOTE + VISUAL THEME + MUSIC MOOD ----------
+# ---------- 1. GENERATE QUOTE + 2 VISUAL THEMES + MUSIC MOOD ----------
 def generate_quote_and_theme() -> dict:
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+
+    if TIME_OF_DAY == "morning":
+        language_instruction = (
+            "Write the quote in ENGLISH — clean, powerful, native English phrasing "
+            "(this is the morning upload, targeting English-speaking audience)."
+        )
+    else:
+        language_instruction = (
+            "Write the quote in HINGLISH — natural mix of Hindi in Roman script and "
+            "English, like something a topper or mentor would say out loud "
+            "(this is the evening upload, targeting Hindi-speaking audience)."
+        )
+
     prompt = (
         "You are creating a YouTube Short for a channel focused on STUDENT MOTIVATION "
         "(exam stress, study discipline, competitive exams like NEET/JEE/UPSC, late-night "
-        "study, focus, results). Do three things:\n"
-        "1. Write one short, original, motivational quote in Hinglish (mix of Hindi in "
-        "Roman script and English, natural student-relatable tone — like something a "
-        "topper or mentor would say). Max 14 words. No author name, no quotation marks, "
-        "no hashtags, no emojis.\n"
-        "2. Suggest a short visual theme (3-5 words) for stock footage matching student "
-        "life — e.g. 'student studying night desk lamp', 'library books focus', "
-        "'writing notes exam prep', 'sunrise study morning motivation', "
-        "'backpack walking college campus'.\n"
+        "study, focus, results, sacrifice of parents/family). Do four things:\n\n"
+    )
+
+    if CONTENT_TYPE == "quote":
+        prompt += (
+            "1. Write one short, ORIGINAL, emotionally powerful two-line motivational quote. "
+            f"{language_instruction} "
+            "Aim for a creative, punchy structure with a turn/contrast between the two lines "
+            "— not a generic one-liner. For example, in tone and structure (do NOT copy this, "
+            "write a completely new one): \"They sold their own dreams, just to buy yours; "
+            "Now you have to achieve something... so that the dreams in their eyes don't "
+            "drown in tears.\" Max 30 words total across both lines. No author name, no "
+            "quotation marks, no hashtags, no emojis.\n\n"
+        )
+    elif CONTENT_TYPE == "tip":
+        prompt += (
+            "1. Write one short, ORIGINAL, actionable STUDY TIP or study hack a student can "
+            "apply today (e.g. active recall, Pomodoro, spaced repetition, avoiding phone "
+            "distractions, sleep and memory). Phrase it punchy and hook-y, like text overlay "
+            "for a Short, not a dry textbook line. Two short lines: line 1 = a relatable "
+            "problem/hook, line 2 = the tip/fix. "
+            f"{language_instruction} "
+            "Max 30 words total across both lines. No hashtags, no emojis, no quotation marks. "
+            "Do NOT invent fake scientific statistics or percentages — keep claims general "
+            "(e.g. 'helps you remember more' not 'boosts memory by 47%').\n\n"
+        )
+    else:  # habit
+        prompt += (
+            "1. Write one short, ORIGINAL line about a GENERIC daily habit that helps toppers/ "
+            "high-achieving students succeed (e.g. waking up early, no-phone study blocks, "
+            "revision routines, consistency over intensity). Do NOT attribute this to any real, "
+            "named person — keep it generic ('toppers', 'high scorers', 'consistent students'). "
+            "Two short lines: line 1 = the habit, line 2 = why it matters / the payoff. "
+            f"{language_instruction} "
+            "Max 30 words total across both lines. No hashtags, no emojis, no quotation marks.\n\n"
+        )
+
+    prompt += (
+    prompt += (
+        "2. Suggest TWO short visual themes (3-5 words each) for stock footage — "
+        "visual_theme_1 should match the FIRST half/mood of the text, visual_theme_2 "
+        "should match the SECOND half/turn, so the video visually shifts partway "
+        "through matching the emotional shift in the words. e.g. "
+        "'parent working hard tired' -> 'student studying determined night'.\n\n"
         f"3. Pick exactly one music mood from this list only: {', '.join(MUSIC_MOODS)}.\n\n"
+        "4. Write a short, ENGAGING caption/hook (1 sentence, max 15 words) for the video "
+        "description — this must NOT repeat or closely paraphrase the main text itself. "
+        "Instead it should add context, ask a question, or give a call-to-action (e.g. "
+        "'Tag someone who needs to see this today', 'Save this for your next study session', "
+        f"or 'Which line hit different? Comment below.'). Same language as the main text "
+        f"({('English' if TIME_OF_DAY == 'morning' else 'Hinglish')}).\n\n"
         'Return ONLY valid JSON, nothing else, no markdown fences, in this exact shape:\n'
-        '{"quote": "...", "visual_theme": "...", "music_mood": "..."}'
+        '{"quote": "...", "visual_theme_1": "...", "visual_theme_2": "...", '
+        '"music_mood": "...", "caption": "..."}'
     )
 
     last_error = None
@@ -92,13 +170,22 @@ def generate_quote_and_theme() -> dict:
     raw = re.sub(r"^```(json)?|```$", "", raw.strip(), flags=re.MULTILINE).strip()
     data = json.loads(raw)
     data["quote"] = data["quote"].strip().strip('"').strip("'")
+    data["caption"] = data.get("caption", "").strip().strip('"').strip("'")
     if data.get("music_mood") not in MUSIC_MOODS:
         data["music_mood"] = random.choice(MUSIC_MOODS)
+    if not data.get("visual_theme_2"):
+        data["visual_theme_2"] = data.get("visual_theme_1", "motivation study")
+    if not data["caption"]:
+        data["caption"] = (
+            "Follow for daily student motivation."
+            if TIME_OF_DAY == "morning"
+            else "Roz aisi hi motivation ke liye follow karo."
+        )
     return data
 
 
-# ---------- 2. FETCH BACKGROUND VIDEO (THEME-MATCHED) ----------
-def fetch_background_video(visual_theme: str) -> Path:
+# ---------- 2. FETCH BACKGROUND VIDEOS (THEME-MATCHED, TWO CLIPS) ----------
+def fetch_background_video(visual_theme: str, out_name: str) -> Path:
     headers = {"Authorization": os.environ["PEXELS_API_KEY"]}
     r = requests.get(
         "https://api.pexels.com/videos/search",
@@ -131,7 +218,7 @@ def fetch_background_video(visual_theme: str) -> Path:
     portrait_files = [f for f in files if (f.get("height") or 0) >= (f.get("width") or 1)]
     chosen = portrait_files[0] if portrait_files else files[0]
 
-    out_path = WORKDIR / "background.mp4"
+    out_path = WORKDIR / out_name
     with requests.get(chosen["link"], stream=True, timeout=60) as resp:
         resp.raise_for_status()
         with open(out_path, "wb") as f:
@@ -140,19 +227,24 @@ def fetch_background_video(visual_theme: str) -> Path:
     return out_path
 
 
-# ---------- 3. FETCH MUSIC (LOCAL FIRST, JAMENDO FALLBACK) ----------
+# ---------- 3. FETCH MUSIC (SEQUENTIAL LOCAL FIRST, JAMENDO FALLBACK) ----------
 def fetch_music(mood: str) -> tuple[Path, str]:
     """
     Priority order:
     1. If you've manually added mp3s (e.g. downloaded from YouTube Audio Library)
-       into assets/music/, pick randomly from those — no attribution needed, since
-       YT Audio Library tracks are cleared for free use.
+       into assets/music/, pick SEQUENTIALLY from those (deterministic rotation based
+       on date + morning/evening slot) — no attribution needed, cycles through all
+       tracks before repeating, avoiding duplicate music back-to-back.
     2. Otherwise, auto-fetch a mood-matched Creative Commons track from Jamendo,
        with attribution added automatically (required by that license).
     """
-    local_tracks = list(MUSIC_DIR.glob("*.mp3"))
+    local_tracks = sorted(MUSIC_DIR.glob("*.mp3"))
     if local_tracks:
-        chosen = random.choice(local_tracks)
+        days_since_epoch = int(time.time() // 86400)
+        slot = 0 if TIME_OF_DAY == "morning" else 1
+        sequence_index = (days_since_epoch * 2 + slot) % len(local_tracks)
+        chosen = local_tracks[sequence_index]
+        print(f"Sequential music pick: {chosen.name} (index {sequence_index}/{len(local_tracks)})")
         return chosen, ""  # no attribution needed for YT Audio Library tracks
 
     jamendo_id = os.environ.get("JAMENDO_CLIENT_ID")
@@ -176,7 +268,6 @@ def fetch_music(mood: str) -> tuple[Path, str]:
     results = r.json().get("results", [])
 
     if not results:
-        # Fallback: drop the mood filter, just grab any commercial-safe track
         params.pop("tags")
         r = requests.get("https://api.jamendo.com/v3.0/tracks/", params=params, timeout=30)
         r.raise_for_status()
@@ -201,7 +292,7 @@ def fetch_music(mood: str) -> tuple[Path, str]:
     return out_path, attribution
 
 
-# ---------- 4. BUILD VIDEO WITH FFMPEG ----------
+# ---------- 4. BUILD VIDEO WITH FFMPEG (2 CLIPS CONCATENATED) ----------
 def escape_drawtext(text: str) -> str:
     text = text.replace("\\", "\\\\")
     text = text.replace(":", "\\:")
@@ -210,35 +301,40 @@ def escape_drawtext(text: str) -> str:
     return text
 
 
-def wrap_quote(quote: str, width: int = 22) -> str:
+def wrap_quote(quote: str, width: int = 24) -> str:
     lines = textwrap.wrap(quote, width=width)
     return "\n".join(lines)
 
 
-def build_video(background: Path, music: Path, quote: str) -> Path:
+def build_video(bg1: Path, bg2: Path, music: Path, quote: str) -> Path:
     wrapped = wrap_quote(quote)
     safe_text = escape_drawtext(wrapped)
     out_path = WORKDIR / "short.mp4"
 
     drawtext = (
         f"drawtext=fontfile={FONT_PATH}:text='{safe_text}':"
-        "fontcolor=white:fontsize=64:line_spacing=14:"
+        "fontcolor=white:fontsize=58:line_spacing=14:"
         "x=(w-text_w)/2:y=(h-text_h)/2:"
         "box=1:boxcolor=black@0.45:boxborderw=30"
     )
 
     filter_complex = (
         f"[0:v]scale=1080:1920:force_original_aspect_ratio=increase,"
-        f"crop=1080:1920,trim=0:{VIDEO_DURATION},setpts=PTS-STARTPTS,{drawtext}[v]"
+        f"crop=1080:1920,trim=0:{CLIP_DURATION},setpts=PTS-STARTPTS[v0];"
+        f"[1:v]scale=1080:1920:force_original_aspect_ratio=increase,"
+        f"crop=1080:1920,trim=0:{CLIP_DURATION},setpts=PTS-STARTPTS[v1];"
+        f"[v0][v1]concat=n=2:v=1:a=0[vcat];"
+        f"[vcat]{drawtext}[vout]"
     )
 
     cmd = [
         "ffmpeg", "-y",
-        "-i", str(background),
+        "-i", str(bg1),
+        "-i", str(bg2),
         "-i", str(music),
         "-filter_complex", filter_complex,
-        "-map", "[v]",
-        "-map", "1:a",
+        "-map", "[vout]",
+        "-map", "2:a",
         "-shortest",
         "-t", str(VIDEO_DURATION),
         "-c:v", "libx264", "-preset", "fast", "-crf", "23",
@@ -250,7 +346,7 @@ def build_video(background: Path, music: Path, quote: str) -> Path:
 
 
 # ---------- 5. UPLOAD TO YOUTUBE ----------
-def upload_to_youtube(video_path: Path, quote: str, music_attribution: str):
+def upload_to_youtube(video_path: Path, quote: str, caption: str, music_attribution: str):
     creds = Credentials(
         token=None,
         refresh_token=os.environ["YT_REFRESH_TOKEN"],
@@ -263,11 +359,25 @@ def upload_to_youtube(video_path: Path, quote: str, music_attribution: str):
 
     title = quote if len(quote) <= 90 else quote[:87] + "..."
     music_line = f"{music_attribution}\n\n" if music_attribution else ""
+
+    if TIME_OF_DAY == "morning":
+        hashtags = "#motivation #shorts #studentlife #discipline #success"
+        tags = ["motivation", "shorts", "student life", "discipline", "success"]
+    elif CONTENT_TYPE == "tip":
+        hashtags = "#studytips #shorts #studyhacks #studentlife #examtips"
+        tags = ["study tips", "shorts", "study hacks", "student life", "exam tips"]
+    elif CONTENT_TYPE == "habit":
+        hashtags = "#toppertips #shorts #studyhabits #studentlife #discipline"
+        tags = ["topper habits", "shorts", "study habits", "student life", "discipline"]
+    else:
+        hashtags = "#studymotivation #shorts #examstress #studentlife #discipline"
+        tags = ["study motivation", "shorts", "exam motivation", "student life", "discipline"]
+
     body = {
         "snippet": {
             "title": f"{title} #shorts",
-            "description": f"{quote}\n\n{music_line}#studymotivation #shorts #examstress #studentlife #discipline",
-            "tags": ["study motivation", "shorts", "exam motivation", "student life", "discipline"],
+            "description": f"{caption}\n\n\"{quote}\"\n\n{music_line}{hashtags}",
+            "tags": tags,
             "categoryId": "22",
         },
         "status": {
@@ -285,25 +395,35 @@ def upload_to_youtube(video_path: Path, quote: str, music_attribution: str):
 
 # ---------- MAIN ----------
 def main():
-    print("Generating quote + visual theme + music mood...")
+    print(f"Time of day: {TIME_OF_DAY}")
+    print(f"Content type: {CONTENT_TYPE}")
+    print("Generating quote + visual themes + music mood...")
     data = generate_quote_and_theme()
-    quote, visual_theme, music_mood = data["quote"], data["visual_theme"], data["music_mood"]
+    quote = data["quote"]
+    theme1, theme2 = data["visual_theme_1"], data["visual_theme_2"]
+    music_mood = data["music_mood"]
     print(f"Quote: {quote}")
-    print(f"Visual theme: {visual_theme}")
+    print(f"Caption: {data['caption']}")
+    print(f"Visual theme 1: {theme1}")
+    print(f"Visual theme 2: {theme2}")
     print(f"Music mood: {music_mood}")
 
-    print("Fetching matching background video...")
-    bg = fetch_background_video(visual_theme)
+    print("Fetching first background video...")
+    bg1 = fetch_background_video(theme1, "background1.mp4")
 
-    print("Fetching matching music...")
+    print("Fetching second background video...")
+    bg2 = fetch_background_video(theme2, "background2.mp4")
+
+    print("Fetching music...")
     music, attribution = fetch_music(music_mood)
-    print(attribution)
+    if attribution:
+        print(attribution)
 
     print("Building video...")
-    video = build_video(bg, music, quote)
+    video = build_video(bg1, bg2, music, quote)
 
     print("Uploading to YouTube...")
-    upload_to_youtube(video, quote, attribution)
+    upload_to_youtube(video, quote, data["caption"], attribution)
 
     print("Done.")
 
