@@ -27,6 +27,8 @@ import google.generativeai as genai
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+import asyncio
+import edge_tts
 
 # ---------- CONFIG ----------
 WORKDIR = Path("work")
@@ -70,22 +72,31 @@ if _env_model:
 # Allowed Jamendo mood tags (kept tight so results stay on-brand)
 MUSIC_MOODS = ["uplifting", "epic", "chill", "inspiring", "energetic", "calm", "cinematic", "ambient"]
 
+# English voiceover: only used on the morning slot (English quotes). Edge TTS is
+# free, needs no API key. "en-US-GuyNeural" is a clear, confident male voice —
+# change to "en-US-JennyNeural" (female) if preferred.
+# Voiceover: enabled only for the morning slot, using Edge TTS's Hindi neural
+# voice — much better pronunciation for Hinglish text than generic/robotic TTS
+# engines, since it's trained specifically on Hindi speech.
+VOICEOVER_ENABLED = TIME_OF_DAY == "morning"
+VOICEOVER_VOICE = os.environ.get("VOICEOVER_VOICE", "hi-IN-MadhurNeural")
+
+# Content-gap topic hints: update this via the TOPIC_HINTS GitHub Secret whenever
+# you check YouTube Studio → Analytics → Research → Content gaps. Comma-separated
+# topics, e.g. "learning and motivation, 90 minutes of focused studying"
+TOPIC_HINTS = os.environ.get("TOPIC_HINTS", "").strip()
+
 
 # ---------- 1. GENERATE QUOTE + 2 VISUAL THEMES + MUSIC MOOD ----------
 def generate_quote_and_theme() -> dict:
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
 
-    if TIME_OF_DAY == "morning":
-        language_instruction = (
-            "Write the quote in ENGLISH — clean, powerful, native English phrasing "
-            "(this is the morning upload, targeting English-speaking audience)."
-        )
-    else:
-        language_instruction = (
-            "Write the quote in HINGLISH — natural mix of Hindi in Roman script and "
-            "English, like something a topper or mentor would say out loud "
-            "(this is the evening upload, targeting Hindi-speaking audience)."
-        )
+    # Language: locked to Hinglish for both slots — best performing content type
+    # based on channel data (Hindi/Hinglish emotional quotes outperformed everything).
+    language_instruction = (
+        "Write the text in HINGLISH — natural mix of Hindi in Roman script and "
+        "English, like something a topper or mentor would say out loud."
+    )
 
     prompt = (
         "You are creating a YouTube Short for a channel focused on STUDENT MOTIVATION "
@@ -127,6 +138,13 @@ def generate_quote_and_theme() -> dict:
             "Max 30 words total across both lines. No hashtags, no emojis, no quotation marks.\n\n"
         )
 
+    if TOPIC_HINTS:
+        prompt += (
+            f"\nIMPORTANT: Today, lean the theme/angle toward one of these currently "
+            f"trending topics if it fits naturally (don't state the hint verbatim, "
+            f"just let the angle inspire the content): {TOPIC_HINTS}\n\n"
+        )
+
     prompt += (
         "2. Suggest TWO short visual themes (3-5 words each) for stock footage — "
         "visual_theme_1 should match the FIRST half/mood of the text, visual_theme_2 "
@@ -139,7 +157,7 @@ def generate_quote_and_theme() -> dict:
         "Instead it should add context, ask a question, or give a call-to-action (e.g. "
         "'Tag someone who needs to see this today', 'Save this for your next study session', "
         f"or 'Which line hit different? Comment below.'). Same language as the main text "
-        f"({('English' if TIME_OF_DAY == 'morning' else 'Hinglish')}).\n\n"
+        f"(Hinglish).\n\n"
         'Return ONLY valid JSON, nothing else, no markdown fences, in this exact shape:\n'
         '{"quote": "...", "visual_theme_1": "...", "visual_theme_2": "...", '
         '"music_mood": "...", "caption": "..."}'
@@ -175,11 +193,7 @@ def generate_quote_and_theme() -> dict:
     if not data.get("visual_theme_2"):
         data["visual_theme_2"] = data.get("visual_theme_1", "motivation study")
     if not data["caption"]:
-        data["caption"] = (
-            "Follow for daily student motivation."
-            if TIME_OF_DAY == "morning"
-            else "Roz aisi hi motivation ke liye follow karo."
-        )
+        data["caption"] = "Roz aisi hi motivation ke liye follow karo."
     return data
 
 
@@ -291,7 +305,30 @@ def fetch_music(mood: str) -> tuple[Path, str]:
     return out_path, attribution
 
 
-# ---------- 4. BUILD VIDEO WITH FFMPEG (2 CLIPS CONCATENATED) ----------
+# ---------- 4. GENERATE VOICEOVER (MORNING/ENGLISH ONLY, FREE EDGE TTS) ----------
+def generate_voiceover(text: str) -> Path:
+    out_path = WORKDIR / "voiceover.mp3"
+
+    async def _synthesize():
+        communicate = edge_tts.Communicate(text, VOICEOVER_VOICE)
+        await communicate.save(str(out_path))
+
+    asyncio.run(_synthesize())
+    return out_path
+
+
+def get_audio_duration(path: Path) -> float:
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+        ],
+        capture_output=True, text=True, check=True,
+    )
+    return float(result.stdout.strip())
+
+
+# ---------- 5. BUILD VIDEO WITH FFMPEG (2 CLIPS CONCATENATED) ----------
 def escape_drawtext(text: str) -> str:
     text = text.replace("\\", "\\\\")
     text = text.replace(":", "\\:")
@@ -305,7 +342,8 @@ def wrap_quote(quote: str, width: int = 24) -> str:
     return "\n".join(lines)
 
 
-def build_video(bg1: Path, bg2: Path, music: Path, quote: str) -> Path:
+def build_video(bg1: Path, bg2: Path, music: Path, quote: str,
+                 duration: int, clip_duration: int, voiceover: Path | None = None) -> Path:
     wrapped = wrap_quote(quote)
     safe_text = escape_drawtext(wrapped)
     out_path = WORKDIR / "short.mp4"
@@ -317,25 +355,39 @@ def build_video(bg1: Path, bg2: Path, music: Path, quote: str) -> Path:
         "box=1:boxcolor=black@0.45:boxborderw=30"
     )
 
-    filter_complex = (
+    video_filter = (
         f"[0:v]scale=1080:1920:force_original_aspect_ratio=increase,"
-        f"crop=1080:1920,trim=0:{CLIP_DURATION},setpts=PTS-STARTPTS[v0];"
+        f"crop=1080:1920,trim=0:{clip_duration},setpts=PTS-STARTPTS[v0];"
         f"[1:v]scale=1080:1920:force_original_aspect_ratio=increase,"
-        f"crop=1080:1920,trim=0:{CLIP_DURATION},setpts=PTS-STARTPTS[v1];"
+        f"crop=1080:1920,trim=0:{clip_duration},setpts=PTS-STARTPTS[v1];"
         f"[v0][v1]concat=n=2:v=1:a=0[vcat];"
         f"[vcat]{drawtext}[vout]"
     )
 
+    inputs = ["-i", str(bg1), "-i", str(bg2), "-i", str(music)]
+
+    if voiceover is not None:
+        # Voiceover at full volume, background music ducked underneath it, mixed together.
+        inputs += ["-i", str(voiceover)]
+        audio_filter = (
+            "[2:a]volume=0.18[musicq];"
+            "[3:a]volume=1.0[voiceq];"
+            "[voiceq][musicq]amix=inputs=2:duration=first:dropout_transition=2[aout]"
+        )
+        filter_complex = video_filter + ";" + audio_filter
+        audio_map = "[aout]"
+    else:
+        filter_complex = video_filter
+        audio_map = "2:a"
+
     cmd = [
         "ffmpeg", "-y",
-        "-i", str(bg1),
-        "-i", str(bg2),
-        "-i", str(music),
+        *inputs,
         "-filter_complex", filter_complex,
         "-map", "[vout]",
-        "-map", "2:a",
+        "-map", audio_map,
         "-shortest",
-        "-t", str(VIDEO_DURATION),
+        "-t", str(duration),
         "-c:v", "libx264", "-preset", "fast", "-crf", "23",
         "-c:a", "aac", "-b:a", "128k",
         str(out_path),
@@ -359,10 +411,7 @@ def upload_to_youtube(video_path: Path, quote: str, caption: str, music_attribut
     title = quote if len(quote) <= 90 else quote[:87] + "..."
     music_line = f"{music_attribution}\n\n" if music_attribution else ""
 
-    if TIME_OF_DAY == "morning":
-        hashtags = "#motivation #shorts #studentlife #discipline #success"
-        tags = ["motivation", "shorts", "student life", "discipline", "success"]
-    elif CONTENT_TYPE == "tip":
+    if CONTENT_TYPE == "tip":
         hashtags = "#studytips #shorts #studyhacks #studentlife #examtips"
         tags = ["study tips", "shorts", "study hacks", "student life", "exam tips"]
     elif CONTENT_TYPE == "habit":
@@ -418,14 +467,12 @@ def main():
     if attribution:
         print(attribution)
 
-    print("Building video...")
-    video = build_video(bg1, bg2, music, quote)
-
-    print("Uploading to YouTube...")
-    upload_to_youtube(video, quote, data["caption"], attribution)
-
-    print("Done.")
-
-
-if __name__ == "__main__":
-    main()
+    duration = VIDEO_DURATION
+    clip_duration = CLIP_DURATION
+    voiceover_path = None
+    if VOICEOVER_ENABLED:
+        print("Generating English voiceover (Edge TTS)...")
+        voice_text = quote.replace("\n", ". ")
+        voiceover_path = generate_voiceover(voice_text)
+        voice_len = get_audio_duration(voiceover_path)
+        # Give the voice room to finish, plus a ~
