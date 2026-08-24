@@ -11,7 +11,9 @@ on:
 jobs:
   build-and-upload:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
+    permissions:
+      contents: write
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -34,7 +36,17 @@ jobs:
           GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
           JAMENDO_CLIENT_ID: ${{ secrets.JAMENDO_CLIENT_ID }}
+          TOPIC_HINTS: ${{ secrets.TOPIC_HINTS }}
           YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
         run: python generate_and_upload_short.py
+
+      - name: Commit content log
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add content_log.csv
+          git diff --staged --quiet || git commit -m "Log content entry [skip ci]"
+          git push
