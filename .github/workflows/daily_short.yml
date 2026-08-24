@@ -47,6 +47,10 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add content_log.csv
-          git diff --staged --quiet || git commit -m "Log content entry [skip ci]"
-          git push
+          if [ -f content_log.csv ]; then
+            git add content_log.csv
+            git diff --staged --quiet || git commit -m "Log content entry [skip ci]"
+            git push
+          else
+            echo "content_log.csv not found (pipeline likely failed before logging) — skipping commit"
+          fi
