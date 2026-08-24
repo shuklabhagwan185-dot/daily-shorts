@@ -42,18 +42,33 @@ TIME_OF_DAY = os.environ.get("TIME_OF_DAY", "evening").strip().lower()
 if TIME_OF_DAY not in ("morning", "evening"):
     TIME_OF_DAY = "evening"
 
-# Content type rotation:
-# - Morning slot is always a QUOTE (best for an emotional start to the day)
-# - Evening slot alternates between a STUDY TIP and a TOPPER HABIT day-by-day,
-#   so the channel doesn't feel like an endless quote loop, while staying at
-#   exactly 2 uploads/day.
-import datetime
-_day_of_year = datetime.date.today().timetuple().tm_yday
-if TIME_OF_DAY == "morning":
-    CONTENT_TYPE = "quote"
-else:
-    CONTENT_TYPE = "tip" if _day_of_year % 2 == 0 else "habit"
-CONTENT_TYPE = os.environ.get("CONTENT_TYPE_OVERRIDE", CONTENT_TYPE)
+# ---------- CONTENT CATEGORIES (Phase 5: problem-first, not generic quotes) ----------
+# Each category maps to a real student problem. Weighted so procrastination/distraction/
+# technique content (proven higher-engagement types) show up more than generic quotes.
+# NOT hard-coded forever — once real performance data exists (Stage 2), these weights
+# should shift based on what's actually working.
+CONTENT_CATEGORIES = {
+    "procrastination":       {"weight": 15, "hashtag": "#procrastination"},
+    "phone_distraction":     {"weight": 15, "hashtag": "#phonedistraction"},
+    "study_technique":       {"weight": 20, "hashtag": "#studytips"},
+    "exam_psychology":       {"weight": 15, "hashtag": "#exampsychology"},
+    "concentration_revision": {"weight": 15, "hashtag": "#revision"},
+    "topper_habit":          {"weight": 10, "hashtag": "#toppertips"},
+    "emotional_quote":       {"weight": 10, "hashtag": "#studymotivation"},
+}
+
+def pick_content_category() -> str:
+    override = os.environ.get("CONTENT_TYPE_OVERRIDE", "").strip()
+    if override in CONTENT_CATEGORIES:
+        return override
+    names = list(CONTENT_CATEGORIES.keys())
+    weights = [CONTENT_CATEGORIES[n]["weight"] for n in names]
+    return random.choices(names, weights=weights, k=1)[0]
+
+CONTENT_TYPE = pick_content_category()
+
+HOOK_STYLES = ["curiosity", "pain_recognition", "contrarian", "direct_question", "challenge"]
+HOOK_STYLE = random.choice(HOOK_STYLES)
 
 # Gemini model: configurable via secret since Google renames/retires models often.
 # If GEMINI_MODEL secret is set, that's tried first. Otherwise the script tries this
@@ -98,45 +113,89 @@ def generate_quote_and_theme() -> dict:
         "English, like something a topper or mentor would say out loud."
     )
 
-    prompt = (
-        "You are creating a YouTube Short for a channel focused on STUDENT MOTIVATION "
-        "(exam stress, study discipline, competitive exams like NEET/JEE/UPSC, late-night "
-        "study, focus, results, sacrifice of parents/family). Do four things:\n\n"
+CATEGORY_TOPICS = {
+    "procrastination": [
+        "kal se padhunga (always postponing study to tomorrow)",
+        "starting to study feels impossible even though the student wants to",
+        "wasting hours before finally opening the book",
+    ],
+    "phone_distraction": [
+        "checking phone every few minutes while trying to study",
+        "opening the book but reaching for the phone instead",
+        "social media eating up study time without realizing it",
+    ],
+    "study_technique": [
+        "studying for hours but forgetting everything after",
+        "not knowing how to revise effectively before exams",
+        "active recall / testing yourself instead of just re-reading",
+        "the Pomodoro technique for focused study blocks",
+    ],
+    "exam_psychology": [
+        "exam anxiety and fear of failure before a big test",
+        "panic and blank mind during the actual exam",
+        "comparing yourself to toppers and feeling behind",
+    ],
+    "concentration_revision": [
+        "huge syllabus feels overwhelming and impossible to finish",
+        "low mock test scores despite studying a lot",
+        "losing concentration after 20-30 minutes of study",
+    ],
+    "topper_habit": [
+        "a generic daily habit that helps high scorers stay consistent",
+        "toppers' no-phone study blocks or revision routines",
+    ],
+    "emotional_quote": [
+        "the sacrifice parents make so their child can study and succeed",
+        "an emotional two-line quote with a contrast/twist about hard work and results",
+    ],
+}
+
+
+# ---------- 1. GENERATE SCRIPT + 2 VISUAL THEMES + MUSIC MOOD ----------
+def generate_quote_and_theme() -> dict:
+    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+
+    language_instruction = (
+        "Write in HINGLISH — natural mix of Hindi in Roman script and English, "
+        "like something a topper or mentor would say out loud to an Indian "
+        "student preparing for NEET/JEE/UPSC or school/college exams."
     )
 
-    if CONTENT_TYPE == "quote":
-        prompt += (
-            "1. Write one short, ORIGINAL, emotionally powerful two-line motivational quote. "
-            f"{language_instruction} "
-            "Aim for a creative, punchy structure with a turn/contrast between the two lines "
-            "— not a generic one-liner. For example, in tone and structure (do NOT copy this, "
-            "write a completely new one): \"They sold their own dreams, just to buy yours; "
-            "Now you have to achieve something... so that the dreams in their eyes don't "
-            "drown in tears.\" Max 30 words total across both lines. No author name, no "
+    topic = random.choice(CATEGORY_TOPICS[CONTENT_TYPE])
+    hook_style_desc = {
+        "curiosity": "a curiosity-driven hook that makes the student want to know what comes next",
+        "pain_recognition": "a hook that immediately names the student's exact problem so they think 'this is me'",
+        "contrarian": "a hook that challenges a common belief or assumption about studying",
+        "direct_question": "a hook phrased as a direct question to the viewer",
+        "challenge": "a hook that gives the viewer a small challenge to try right now",
+    }[HOOK_STYLE]
+
+    if CONTENT_TYPE == "emotional_quote":
+        prompt = (
+            "You are creating a YouTube Short for a Hinglish student-motivation channel "
+            "(NEET/JEE/UPSC, Indian students). Do four things:\n\n"
+            f"1. Write one short, ORIGINAL, emotionally powerful two-line quote about: {topic}. "
+            f"{language_instruction} Aim for a creative structure with a turn/contrast between "
+            "the two lines — not a generic one-liner. Max 30 words total. No author name, no "
             "quotation marks, no hashtags, no emojis.\n\n"
         )
-    elif CONTENT_TYPE == "tip":
-        prompt += (
-            "1. Write one short, ORIGINAL, actionable STUDY TIP or study hack a student can "
-            "apply today (e.g. active recall, Pomodoro, spaced repetition, avoiding phone "
-            "distractions, sleep and memory). Phrase it punchy and hook-y, like text overlay "
-            "for a Short, not a dry textbook line. Two short lines: line 1 = a relatable "
-            "problem/hook, line 2 = the tip/fix. "
-            f"{language_instruction} "
-            "Max 30 words total across both lines. No hashtags, no emojis, no quotation marks. "
-            "Do NOT invent fake scientific statistics or percentages — keep claims general "
-            "(e.g. 'helps you remember more' not 'boosts memory by 47%').\n\n"
+    else:
+        prompt = (
+            "You are creating a YouTube Short for a Hinglish student-motivation channel "
+            "(NEET/JEE/UPSC, Indian students), built around a PROBLEM -> HOOK -> INSIGHT -> "
+            "SOLUTION structure (not a generic quote). Do four things:\n\n"
+            f"1. The topic is: {topic}. "
+            f"Write a short script (3-4 short lines, max 45 words total) with this structure: "
+            f"Line 1 = HOOK using {hook_style_desc}. "
+            "Line 2 = brief psychological insight (why this happens — no fake statistics or "
+            "invented scientific claims, keep it general and credible). "
+            "Line 3 = one practical, concrete action the student can do right now. "
+            "Optionally line 4 = a tiny call-to-action/challenge (e.g. 'Comment DONE when you "
+            f"finish'). {language_instruction} No hashtags, no emojis, no quotation marks. "
+            "Do not sound identical to a generic motivational quote — this should feel like "
+            "practical advice from someone who understands the student's exact problem.\n\n"
         )
-    else:  # habit
-        prompt += (
-            "1. Write one short, ORIGINAL line about a GENERIC daily habit that helps toppers/ "
-            "high-achieving students succeed (e.g. waking up early, no-phone study blocks, "
-            "revision routines, consistency over intensity). Do NOT attribute this to any real, "
-            "named person — keep it generic ('toppers', 'high scorers', 'consistent students'). "
-            "Two short lines: line 1 = the habit, line 2 = why it matters / the payoff. "
-            f"{language_instruction} "
-            "Max 30 words total across both lines. No hashtags, no emojis, no quotation marks.\n\n"
-        )
+
 
     if TOPIC_HINTS:
         prompt += (
@@ -397,7 +456,7 @@ def build_video(bg1: Path, bg2: Path, music: Path, quote: str,
 
 
 # ---------- 5. UPLOAD TO YOUTUBE ----------
-def upload_to_youtube(video_path: Path, quote: str, caption: str, music_attribution: str):
+def upload_to_youtube(video_path: Path, quote: str, caption: str, music_attribution: str) -> str:
     creds = Credentials(
         token=None,
         refresh_token=os.environ["YT_REFRESH_TOKEN"],
@@ -405,74 +464,4 @@ def upload_to_youtube(video_path: Path, quote: str, caption: str, music_attribut
         client_secret=os.environ["YT_CLIENT_SECRET"],
         token_uri="https://oauth2.googleapis.com/token",
         scopes=["https://www.googleapis.com/auth/youtube.upload"],
-    )
-    youtube = build("youtube", "v3", credentials=creds)
-
-    title = quote if len(quote) <= 90 else quote[:87] + "..."
-    music_line = f"{music_attribution}\n\n" if music_attribution else ""
-
-    if CONTENT_TYPE == "tip":
-        hashtags = "#studytips #shorts #studyhacks #studentlife #examtips"
-        tags = ["study tips", "shorts", "study hacks", "student life", "exam tips"]
-    elif CONTENT_TYPE == "habit":
-        hashtags = "#toppertips #shorts #studyhabits #studentlife #discipline"
-        tags = ["topper habits", "shorts", "study habits", "student life", "discipline"]
-    else:
-        hashtags = "#studymotivation #shorts #examstress #studentlife #discipline"
-        tags = ["study motivation", "shorts", "exam motivation", "student life", "discipline"]
-
-    body = {
-        "snippet": {
-            "title": f"{title} #shorts",
-            "description": f"{caption}\n\n\"{quote}\"\n\n{music_line}{hashtags}",
-            "tags": tags,
-            "categoryId": "22",
-        },
-        "status": {
-            "privacyStatus": "public",
-            "selfDeclaredMadeForKids": False,
-        },
-    }
-    media = MediaFileUpload(str(video_path), mimetype="video/mp4", resumable=True)
-    request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
-    response = None
-    while response is None:
-        status, response = request.next_chunk()
-    print(f"Uploaded video ID: {response.get('id')}")
-
-
-# ---------- MAIN ----------
-def main():
-    print(f"Time of day: {TIME_OF_DAY}")
-    print(f"Content type: {CONTENT_TYPE}")
-    print("Generating quote + visual themes + music mood...")
-    data = generate_quote_and_theme()
-    quote = data["quote"]
-    theme1, theme2 = data["visual_theme_1"], data["visual_theme_2"]
-    music_mood = data["music_mood"]
-    print(f"Quote: {quote}")
-    print(f"Caption: {data['caption']}")
-    print(f"Visual theme 1: {theme1}")
-    print(f"Visual theme 2: {theme2}")
-    print(f"Music mood: {music_mood}")
-
-    print("Fetching first background video...")
-    bg1 = fetch_background_video(theme1, "background1.mp4")
-
-    print("Fetching second background video...")
-    bg2 = fetch_background_video(theme2, "background2.mp4")
-
-    print("Fetching music...")
-    music, attribution = fetch_music(music_mood)
-    if attribution:
-        print(attribution)
-
-    duration = VIDEO_DURATION
-    clip_duration = CLIP_DURATION
-    voiceover_path = None
-    if VOICEOVER_ENABLED:
-        print("Generating English voiceover (Edge TTS)...")
-        voice_text = quote.replace("\n", ". ")
-        voiceover_path = generate_voiceover(voice_text)
-        voice_len = get_audio_duration(voiceover_path)
-        # Give the voice room to finish, plus a ~
+    
