@@ -489,7 +489,7 @@ async def make_voice(text, output):
         text,
         VOICEOVER_VOICE,
         rate="-2%",
-        pitch="0Hz",
+        pitch="+0Hz",
     )
     with open(output, "wb") as f:
         async for chunk in communicate.stream():
@@ -509,7 +509,7 @@ def get_word_boundaries(text, audio_path):
             text,
             VOICEOVER_VOICE,
             rate="-2%",
-            pitch="0Hz",
+            pitch="+0Hz",
         )
         result = []
         async for chunk in communicate.stream():
