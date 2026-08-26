@@ -6,3 +6,6 @@ google-api-python-client
 edge-tts
 soundfile
 numpy
+torch==2.0.1
+onnxruntime
+pydantic
