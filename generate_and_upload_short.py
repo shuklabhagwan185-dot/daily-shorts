@@ -1,16 +1,16 @@
 """
-DAILY STUDENT MOTIVATION SHORTS v2
+DAILY STUDENT MOTIVATION SHORTS v3
 ----------------------------------
 Built for an Indian student-motivation YouTube Shorts channel.
 
 Pipeline:
 1. Generate a retention-first Hinglish script with Gemini.
-2. Generate 4 visual beats instead of the old 2-clip format.
+2. Generate 5-6 visual beats.
 3. Download portrait stock footage from Pexels.
-4. Generate natural Hindi/Hinglish neural voice with Edge TTS.
-5. Build word-level timings from Edge TTS boundaries.
+4. Generate natural Hindi/Hinglish neural voice with IndicVoice (fallback: Edge TTS).
+5. Build word-level timings from voiceover boundaries.
 6. Render a cinematic 9:16 Short with dynamic captions, zooms, overlays,
-   voice-ducked music and a strong ending/loop.
+   voice-dominant music and a strong ending/loop.
 7. Upload to YouTube.
 8. Append a structured content log.
 
@@ -23,9 +23,8 @@ YT_REFRESH_TOKEN
 
 Optional:
 GEMINI_MODEL
-VOICEOVER_VOICE (default hi-IN-MadhurNeural)
+VOICEOVER_VOICE (default hi-IN-MadhurNeural for fallback Edge TTS)
 TOPIC_HINTS
-JAMENDO_CLIENT_ID
 CONTENT_TYPE_OVERRIDE
 """
 
@@ -43,7 +42,9 @@ from pathlib import Path
 
 import edge_tts
 import google.generativeai as genai
+import numpy as np
 import requests
+import soundfile as sf
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
@@ -303,7 +304,7 @@ CORE REQUIREMENTS:
 8. The script must have a real idea, not merely motivation.
 9. Include a practical action when appropriate.
 10. Do not mention NEET/JEE/UPSC unless it genuinely improves the line.
-11. Target 45-75 spoken words.
+11. Target 45-65 spoken words.
 12. Target approximately 18-24 seconds of speech.
 13. Make the final line memorable.
 14. Do not use emojis.
@@ -503,10 +504,46 @@ def fetch_pexels_video(query, filename, used_ids=None):
 
 
 # ============================================================
-# VOICEOVER
+# VOICEOVER - INDICVOICE WITH FALLBACK TO EDGE TTS
 # ============================================================
 
-async def make_voice(text, output):
+def generate_voiceover_indicvoice(text, output_path):
+    """
+    Generate voiceover using IndicVoice (local, free Hindi TTS).
+    Falls back to Edge TTS if IndicVoice is unavailable.
+    """
+    try:
+        print("Attempting to generate voiceover with IndicVoice...")
+        from indicvoice import IndicPipeline
+        
+        # Initialize pipeline for Hindi
+        pipeline = IndicPipeline(lang_code='hi')
+        
+        # Generate audio using hi_female voice
+        generator = pipeline(text, voice='hi_female')
+        
+        # Collect audio chunks
+        audio_data = None
+        for gs, ps, audio in generator:
+            # audio is a NumPy array
+            audio_data = audio
+            break
+        
+        if audio_data is not None:
+            # Save as WAV at 22050 Hz (standard)
+            sf.write(str(output_path), audio_data, 22050)
+            print(f"IndicVoice audio generated successfully: {output_path}")
+            return output_path
+        else:
+            raise RuntimeError("IndicVoice generated no audio data")
+    
+    except Exception as e:
+        print(f"IndicVoice failed ({e}), falling back to Edge TTS...")
+        return generate_voiceover_edge_tts(text, output_path)
+
+
+async def make_voice_edge_tts(text, output):
+    """Generate voiceover using Edge TTS."""
     communicate = edge_tts.Communicate(
         text,
         VOICEOVER_VOICE,
@@ -520,14 +557,29 @@ async def make_voice(text, output):
                 f.write(chunk["data"])
 
 
-def generate_voiceover(text):
-    audio = WORKDIR / "voiceover.mp3"
-    asyncio.run(make_voice(text, audio))
+def generate_voiceover_edge_tts(text, output_path):
+    """Synchronous wrapper for Edge TTS."""
+    audio = output_path
+    asyncio.run(make_voice_edge_tts(text, audio))
     return audio
 
 
+def generate_voiceover(text):
+    """
+    Main voiceover generation function.
+    Tries IndicVoice first, falls back to Edge TTS.
+    """
+    audio = WORKDIR / "voiceover.wav"
+    return generate_voiceover_indicvoice(text, audio)
+
+
 def get_word_boundaries(text, audio_path):
-    async def collect():
+    """
+    Extract word-level timing from audio.
+    Uses Edge TTS boundaries when available, otherwise estimates from duration.
+    """
+    # Try to get Edge TTS boundaries if we used Edge TTS
+    async def collect_edge_tts_boundaries():
         communicate = edge_tts.Communicate(
             text,
             VOICEOVER_VOICE,
@@ -544,20 +596,25 @@ def get_word_boundaries(text, audio_path):
                 })
         return result
 
-    boundaries = asyncio.run(collect())
-    token_list = words(text)
+    try:
+        boundaries = asyncio.run(collect_edge_tts_boundaries())
+        token_list = words(text)
 
-    if len(boundaries) == len(token_list):
-        return [
-            {
-                "word": token,
-                "start": b["offset"],
-                "end": b["offset"] + b["duration"],
-            }
-            for token, b in zip(token_list, boundaries)
-        ]
+        if len(boundaries) == len(token_list):
+            return [
+                {
+                    "word": token,
+                    "start": b["offset"],
+                    "end": b["offset"] + b["duration"],
+                }
+                for token, b in zip(token_list, boundaries)
+            ]
+    except Exception as e:
+        print(f"Could not get Edge TTS boundaries: {e}")
 
+    # Fallback: estimate from audio duration
     duration = probe_duration(audio_path)
+    token_list = words(text)
     per = duration / max(1, len(token_list))
 
     return [
@@ -574,10 +631,14 @@ def get_word_boundaries(text, audio_path):
 # CAPTION ENGINE
 # ============================================================
 
-def make_caption_groups(timings):
-    """Create readable 2-4 word kinetic-caption groups."""
+def make_caption_groups(timings, max_video_duration):
+    """
+    Create readable 2-4 word kinetic-caption groups.
+    Ensure no caption extends beyond max_video_duration.
+    """
     groups = []
     i = 0
+    
     while i < len(timings):
         take = 3
         if i + 4 <= len(timings):
@@ -598,12 +659,20 @@ def make_caption_groups(timings):
             chunk = chunk[:2]
             end_t = chunk[-1]["end"]
 
-        groups.append({
-            "text": " ".join(x["word"] for x in chunk),
-            "start": start_t,
-            "end": max(end_t, start_t + 0.38),
-        })
+        # Clamp end_t to not exceed video duration
+        end_t = min(end_t, max_video_duration - 0.05)
+        start_t = min(start_t, max_video_duration - 0.1)
+        
+        # Only add if start < end and both are valid
+        if start_t < end_t:
+            groups.append({
+                "text": " ".join(x["word"] for x in chunk),
+                "start": start_t,
+                "end": max(end_t, start_t + 0.38),
+            })
+        
         i += len(chunk)
+    
     return groups
 
 
@@ -622,14 +691,14 @@ def write_text_file(name, text):
 # ============================================================
 
 def render_video(content, videos, voice, timings):
-    duration = probe_duration(voice)
-
-    # Keep the final video within a Shorts-friendly duration.
-    duration = min(MAX_DURATION, max(MIN_DURATION, duration))
+    voice_duration = probe_duration(voice)
+    
+    # Clamp final video duration within Shorts range
+    final_duration = min(MAX_DURATION, max(MIN_DURATION, voice_duration))
 
     # Allocate visual beats according to voice timeline.
     n = len(videos)
-    beat_duration = duration / n
+    beat_duration = final_duration / n
 
     input_args = []
     filters = []
@@ -641,7 +710,7 @@ def render_video(content, videos, voice, timings):
         ]
 
         start = i * beat_duration
-        end = duration if i == n - 1 else (i + 1) * beat_duration
+        end = final_duration if i == n - 1 else (i + 1) * beat_duration
 
         # Slight dynamic crop/zoom. Each clip gets a different crop direction.
         zoom = [
@@ -700,7 +769,7 @@ def render_video(content, videos, voice, timings):
     font = FONT_PATH if os.path.exists(FONT_PATH) else \
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
-    groups = make_caption_groups(timings)
+    groups = make_caption_groups(timings, final_duration)
 
     for i, g in enumerate(groups):
         path = write_text_file(f"caption_{i}.txt", g["text"])
@@ -777,23 +846,34 @@ def render_video(content, videos, voice, timings):
             "-i", str(music)
         ]
 
+        # Robust audio filter graph:
+        # 1. Normalize voice to -14 LUFS
+        # 2. Resample music to 48kHz
+        # 3. Trim music to final_duration
+        # 4. Reduce music volume to subtle level (0.055 ≈ 5.5%)
+        # 5. Fade in/out music
+        # 6. Mix voice + music
+        # 7. Final normalization
         audio_filter = (
-            f"[{voice_index}:a]aresample=48000,"
-            "loudnorm=I=-16:TP=-1.5:LRA=11,"
-            "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[voice];"
-            f"[{music_index}:a]aresample=48000,"
-            f"atrim=duration={duration:.3f},"
-            "volume=0.055,"
-            "afade=t=in:st=0:d=1.0,"
-            f"afade=t=out:st={max(0.0, duration-2.0):.3f}:d=2.0[music];"
-            "[voice][music]amix=inputs=2:duration=first:"
-            "dropout_transition=2:normalize=0,"
-            "loudnorm=I=-14:TP=-1.5:LRA=11[aout]"
+            f"[{voice_index}:a]"
+            f"aresample=48000,"
+            f"loudnorm=I=-14:TP=-1.5:LRA=11[voice];"
+            f"[{music_index}:a]"
+            f"aresample=48000,"
+            f"atrim=duration={final_duration:.3f},"
+            f"volume=0.055,"
+            f"afade=t=in:st=0:d=1.0,"
+            f"afade=t=out:st={max(0.0, final_duration-2.0):.3f}:d=2.0[music];"
+            f"[voice][music]"
+            f"amix=inputs=2:duration=first:dropout_transition=2[mixed];"
+            f"[mixed]"
+            f"loudnorm=I=-14:TP=-1.5:LRA=11[aout]"
         )
     else:
         audio_filter = (
-            f"[{voice_index}:a]aresample=48000,volume=1.0,"
-            "loudnorm=I=-14:TP=-1.5:LRA=11[aout]"
+            f"[{voice_index}:a]"
+            f"aresample=48000,"
+            f"loudnorm=I=-14:TP=-1.5:LRA=11[aout]"
         )
 
     filters.append(audio_filter)
@@ -807,7 +887,7 @@ def render_video(content, videos, voice, timings):
         "-filter_complex", ";".join(filters),
         "-map", "[finalv]",
         "-map", "[aout]",
-        "-t", f"{duration:.3f}",
+        "-t", f"{final_duration:.3f}",
         "-r", str(FPS),
         "-c:v", "libx264",
         "-preset", "veryfast",
@@ -841,7 +921,7 @@ def render_video(content, videos, voice, timings):
 
     print("Audio verified:", verify.stdout.strip())
 
-    return output, music, duration
+    return output, music, final_duration
 
 
 # ============================================================
@@ -1037,10 +1117,10 @@ def log_content(content, video_id, duration):
 
 def main():
     print("=" * 70)
-    print("DAILY STUDENT MOTIVATION SHORTS v2")
+    print("DAILY STUDENT MOTIVATION SHORTS v3")
     print("=" * 70)
     print("Time slot:", TIME_OF_DAY)
-    print("Voice:", VOICEOVER_VOICE)
+    print("Voice system: IndicVoice (fallback: Edge TTS)")
 
     # Clean old temporary media.
     for p in WORKDIR.glob("*"):
@@ -1054,6 +1134,7 @@ def main():
 
     print("\nSCRIPT:")
     print(content["script"])
+    print(f"\nWord count: {len(words(content['script']))}")
 
     print("\nVISUAL BEATS:")
     for i, beat in enumerate(content["beats"], 1):
@@ -1062,7 +1143,13 @@ def main():
     script = content["script"]
 
     voice = generate_voiceover(script)
+    print(f"Voiceover generated: {voice}")
+    
+    voice_duration = probe_duration(voice)
+    print(f"Voice duration: {voice_duration:.2f}s")
+    
     timings = get_word_boundaries(script, voice)
+    print(f"Word timings extracted: {len(timings)} words")
 
     # Use up to six distinct clips.
     videos = []
@@ -1107,7 +1194,7 @@ def main():
     print("\n" + "=" * 70)
     print("DONE")
     print("Video ID:", video_id)
-    print("Duration:", round(duration, 2))
+    print("Duration:", round(duration, 2), "seconds")
     print("Category:", content.get("category"))
     print("Title:", content.get("title"))
     print("=" * 70)
